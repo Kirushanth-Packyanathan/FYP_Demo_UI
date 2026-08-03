@@ -252,6 +252,24 @@ def validate_api_connection(base_url: str, timeout: int = 20) -> Tuple[bool, str
             except Exception:
                 pass
 
+            return False, f"Localtunnel password screen detected! Please open {cleaned_url} in a new browser tab once to submit your password or click 'Click to Continue'.", None, None
+        
+        # Check if 200 returned thresholds in json payload
+        if response.status_code == 200:
+            try:
+                res_json = response.json()
+                if isinstance(res_json, dict):
+                    for k_l in ["tau_low", "TAU_LOW", "tau_low_val"]:
+                        if k_l in res_json and res_json[k_l] is not None:
+                            tau_low = float(res_json[k_l])
+                            break
+                    for k_h in ["tau_high", "TAU_HIGH", "tau_high_val"]:
+                        if k_h in res_json and res_json[k_h] is not None:
+                            tau_high = float(res_json[k_h])
+                            break
+            except Exception:
+                pass
+
         if response.status_code in (200, 422, 400, 405):
             msg = f"Connected successfully to API backend ({response.status_code})"
             if tau_low is not None and tau_high is not None:
@@ -260,7 +278,9 @@ def validate_api_connection(base_url: str, timeout: int = 20) -> Tuple[bool, str
         
         if response.status_code == 404:
             return True, f"Backend server reached at {cleaned_url} (HTTP 404)", tau_low, tau_high
+            return True, f"Backend server reached at {cleaned_url} (HTTP 404)", tau_low, tau_high
 
+        return False, f"API returned status code {response.status_code}", None, None
         return False, f"API returned status code {response.status_code}", None, None
 
     except Exception as primary_exc:
@@ -270,21 +290,28 @@ def validate_api_connection(base_url: str, timeout: int = 20) -> Tuple[bool, str
             low_text_get = get_res.text.lower()
             if "<html" in low_text_get and ("localtunnel" in low_text_get or "reminder" in low_text_get or "password" in low_text_get or "tunnel" in low_text_get):
                 return False, f"Localtunnel password screen detected! Please open {cleaned_url} in a new browser tab once to submit your password or click 'Click to Continue'.", None, None
+                return False, f"Localtunnel password screen detected! Please open {cleaned_url} in a new browser tab once to submit your password or click 'Click to Continue'.", None, None
 
             if get_res.status_code in (200, 404, 405, 422, 400):
+                return True, f"Connected to backend server ({get_res.status_code})", tau_low, tau_high
                 return True, f"Connected to backend server ({get_res.status_code})", tau_low, tau_high
         except Exception:
             pass
 
         if isinstance(primary_exc, requests.exceptions.MissingSchema):
             return False, "Invalid URL schema. Please include http:// or https://", None, None
+            return False, "Invalid URL schema. Please include http:// or https://", None, None
         elif isinstance(primary_exc, requests.exceptions.InvalidURL):
+            return False, "Invalid URL format.", None, None
             return False, "Invalid URL format.", None, None
         elif isinstance(primary_exc, requests.exceptions.Timeout):
             return False, f"Connection timed out after {timeout}s. Verify your localtunnel or Colab server is active.", None, None
+            return False, f"Connection timed out after {timeout}s. Verify your localtunnel or Colab server is active.", None, None
         elif isinstance(primary_exc, requests.exceptions.ConnectionError):
             return False, f"Connection refused/failed. Ensure FastAPI server & localtunnel process are running.", None, None
+            return False, f"Connection refused/failed. Ensure FastAPI server & localtunnel process are running.", None, None
         else:
+            return False, f"Connection error ({type(primary_exc).__name__}): {str(primary_exc)}", None, None
             return False, f"Connection error ({type(primary_exc).__name__}): {str(primary_exc)}", None, None
 
 
@@ -425,9 +452,16 @@ def create_fused_uncertainty_gauge(
       Low uncertainty (0.0 - tau_low): Green
       Medium uncertainty (tau_low - tau_high): Orange/Yellow
       High uncertainty (tau_high - 1.00): Red
+      Low uncertainty (0.0 - tau_low): Green
+      Medium uncertainty (tau_low - tau_high): Orange/Yellow
+      High uncertainty (tau_high - 1.00): Red
     """
     # Clamp values between 0 and 1
+    # Clamp values between 0 and 1
     val = max(0.0, min(1.0, float(fused_uncertainty)))
+    t_low = max(0.0, min(1.0, float(tau_low)))
+    t_high = max(t_low, min(1.0, float(tau_high)))
+
     t_low = max(0.0, min(1.0, float(tau_low)))
     t_high = max(t_low, min(1.0, float(tau_high)))
 
@@ -448,6 +482,9 @@ def create_fused_uncertainty_gauge(
                 "borderwidth": 2,
                 "bordercolor": "#cccccc",
                 "steps": [
+                    {"range": [0.0, t_low], "color": "rgba(46, 204, 113, 0.45)"},   # Low (Green)
+                    {"range": [t_low, t_high], "color": "rgba(243, 156, 18, 0.45)"},  # Medium (Yellow/Orange)
+                    {"range": [t_high, 1.00], "color": "rgba(231, 76, 60, 0.45)"},   # High (Red)
                     {"range": [0.0, t_low], "color": "rgba(46, 204, 113, 0.45)"},   # Low (Green)
                     {"range": [t_low, t_high], "color": "rgba(243, 156, 18, 0.45)"},  # Medium (Yellow/Orange)
                     {"range": [t_high, 1.00], "color": "rgba(231, 76, 60, 0.45)"},   # High (Red)
@@ -598,8 +635,13 @@ def main():
         if connect_btn:
             with st.spinner("Testing API connection & fetching thresholds..."):
                 is_valid, msg, t_low, t_high = validate_api_connection(st.session_state["api_url"])
+            with st.spinner("Testing API connection & fetching thresholds..."):
+                is_valid, msg, t_low, t_high = validate_api_connection(st.session_state["api_url"])
                 st.session_state["connection_status"] = is_valid
                 st.session_state["connection_msg"] = msg
+                if is_valid and t_low is not None and t_high is not None:
+                    st.session_state["tau_low"] = t_low
+                    st.session_state["tau_high"] = t_high
                 if is_valid and t_low is not None and t_high is not None:
                     st.session_state["tau_low"] = t_low
                     st.session_state["tau_high"] = t_high
@@ -683,6 +725,15 @@ def main():
                     st.session_state["last_result"] = None
                 else:
                     st.session_state["last_result"] = result_data
+                    if isinstance(result_data, dict):
+                        for k_l in ["tau_low", "TAU_LOW", "tau_low_val"]:
+                            if k_l in result_data and result_data[k_l] is not None:
+                                st.session_state["tau_low"] = float(result_data[k_l])
+                                break
+                        for k_h in ["tau_high", "TAU_HIGH", "tau_high_val"]:
+                            if k_h in result_data and result_data[k_h] is not None:
+                                st.session_state["tau_high"] = float(result_data[k_h])
+                                break
                     if isinstance(result_data, dict):
                         for k_l in ["tau_low", "TAU_LOW", "tau_low_val"]:
                             if k_l in result_data and result_data[k_l] is not None:
@@ -817,6 +868,7 @@ def main():
             )
 
         with col_info:
+            unc_level = "HIGH" if fused_unc >= t_high_val else ("MEDIUM" if fused_unc >= t_low_val else "LOW")
             unc_level = "HIGH" if fused_unc >= t_high_val else ("MEDIUM" if fused_unc >= t_low_val else "LOW")
             st.markdown("### 🔍 Cascade Evaluation Summary")
             st.markdown(
