@@ -7,6 +7,7 @@ Description: A production-quality Streamlit application to interface with the MS
 """
 
 import json
+import math
 import time
 import urllib.parse
 from typing import Dict, Any, Tuple, List, Optional
@@ -213,7 +214,7 @@ def validate_api_connection(base_url: str, timeout: int = 20) -> Tuple[bool, str
                                     tau_high = float(cfg_data[k_h])
                                     break
                             if tau_low is not None and tau_high is not None:
-                                return True, f"Connected to API backend ({cfg_res.status_code}) | Fetched τ_low = {tau_low:.2f}, τ_high = {tau_high:.2f}", tau_low, tau_high
+                                return True, f"Connected to API backend ({cfg_res.status_code}) | Fetched τ_low = {tau_low:.4f}, τ_high = {tau_high:.4f}", tau_low, tau_high
                     except Exception:
                         pass
         except Exception:
@@ -254,7 +255,7 @@ def validate_api_connection(base_url: str, timeout: int = 20) -> Tuple[bool, str
         if response.status_code in (200, 422, 400, 405):
             msg = f"Connected successfully to API backend ({response.status_code})"
             if tau_low is not None and tau_high is not None:
-                msg += f" | Fetched τ_low = {tau_low:.2f}, τ_high = {tau_high:.2f}"
+                msg += f" | Fetched τ_low = {tau_low:.4f}, τ_high = {tau_high:.4f}"
             return True, msg, tau_low, tau_high
         
         if response.status_code == 404:
@@ -321,6 +322,25 @@ def call_mscf_api(base_url: str, query: str, timeout: int = 60, max_retries: int
                     data = response.json()
                     if "execution_time" not in data or data["execution_time"] is None:
                         data["execution_time"] = round(elapsed, 2)
+                    
+                    # Auto-fetch thresholds if missing in /predict response payload
+                    has_l = any(k in data and data[k] is not None for k in ["tau_low", "TAU_LOW"])
+                    has_h = any(k in data and data[k] is not None for k in ["tau_high", "TAU_HIGH"])
+                    if not (has_l and has_h):
+                        for cfg_p in ["/config", "/thresholds"]:
+                            try:
+                                c_res = session.get(f"{cleaned_url}{cfg_p}", timeout=3, verify=False)
+                                if c_res.status_code == 200:
+                                    c_json = c_res.json()
+                                    if isinstance(c_json, dict):
+                                        if "tau_low" in c_json and c_json["tau_low"] is not None:
+                                            data["tau_low"] = float(c_json["tau_low"])
+                                        if "tau_high" in c_json and c_json["tau_high"] is not None:
+                                            data["tau_high"] = float(c_json["tau_high"])
+                                        break
+                            except Exception:
+                                pass
+
                     return data, None
                 except json.JSONDecodeError:
                     return None, "Malformed Response: Server returned invalid JSON payload."
@@ -416,7 +436,10 @@ def create_fused_uncertainty_gauge(
             mode="gauge+number",
             value=val,
             domain={"x": [0, 1], "y": [0, 1]},
-            title={"text": "Fused Uncertainty Metric", "font": {"size": 18, "weight": "bold"}},
+            title={
+                "text": f"<b>Fused Uncertainty Metric</b><br><span style='font-size:12px;color:#555555;'>Color Bands: Low (≤ {t_low:.4f}) | Med ({t_low:.4f}–{t_high:.4f}) | High (≥ {t_high:.4f})</span>",
+                "font": {"size": 17}
+            },
             number={"valueformat": ".3f", "font": {"size": 28}},
             gauge={
                 "axis": {"range": [0, 1], "tickwidth": 1, "tickcolor": "#888888"},
@@ -438,22 +461,31 @@ def create_fused_uncertainty_gauge(
         )
     )
 
-    # Position annotations dynamically based on tau_low and tau_high
-    x_low = round(0.12 + 0.76 * t_low, 2)
-    x_high = round(0.12 + 0.76 * t_high, 2)
+    # Position annotations accurately along semi-circle gauge arc using trigonometry
+    rad_low = math.pi * (1.0 - t_low)
+    x_low = round(0.50 + 0.36 * math.cos(rad_low), 3)
+    y_low = round(0.18 + 0.28 * math.sin(rad_low), 3)
+
+    rad_high = math.pi * (1.0 - t_high)
+    x_high = round(0.50 + 0.36 * math.cos(rad_high), 3)
+    y_high = round(0.18 + 0.28 * math.sin(rad_high), 3)
 
     fig.add_annotation(
-        x=x_low, y=0.15, text=f"<b>τ_low = {t_low:.2f}</b>", showarrow=False,
-        font=dict(size=12, color="#27ae60")
+        x=x_low, y=y_low, text=f"<b>τ_low = {t_low:.4f}</b>", showarrow=True,
+        arrowhead=2, arrowsize=1, arrowwidth=2, arrowcolor="#27ae60",
+        ax=0, ay=25 if t_low < 0.5 else -25,
+        font=dict(size=12, color="#27ae60", family="sans-serif")
     )
     fig.add_annotation(
-        x=x_high, y=0.15, text=f"<b>τ_high = {t_high:.2f}</b>", showarrow=False,
-        font=dict(size=12, color="#c0392b")
+        x=x_high, y=y_high, text=f"<b>τ_high = {t_high:.4f}</b>", showarrow=True,
+        arrowhead=2, arrowsize=1, arrowwidth=2, arrowcolor="#c0392b",
+        ax=0, ay=25 if t_high < 0.5 else -25,
+        font=dict(size=12, color="#c0392b", family="sans-serif")
     )
 
     fig.update_layout(
-        height=280,
-        margin=dict(l=25, r=25, t=50, b=20),
+        height=310,
+        margin=dict(l=25, r=25, t=65, b=20),
         paper_bgcolor="rgba(0,0,0,0)",
         font=dict(family="sans-serif"),
     )
@@ -519,6 +551,15 @@ def main():
     if "tau_high" not in st.session_state:
         st.session_state["tau_high"] = 0.70
 
+    # Auto-check API connection on initial load to fetch dynamic thresholds
+    if st.session_state["connection_status"] is None and st.session_state.get("api_url"):
+        is_valid, msg, t_low, t_high = validate_api_connection(st.session_state["api_url"])
+        st.session_state["connection_status"] = is_valid
+        st.session_state["connection_msg"] = msg
+        if is_valid and t_low is not None and t_high is not None:
+            st.session_state["tau_low"] = t_low
+            st.session_state["tau_high"] = t_high
+
     # --------------------------------------------------------------------------
     # SIDEBAR COMPONENT
     # --------------------------------------------------------------------------
@@ -534,7 +575,19 @@ def main():
             help="Paste your public tunnel or local FastAPI base URL. The application automatically appends /predict."
         )
         
-        st.session_state["api_url"] = url_input
+        cleaned_input = url_input.strip()
+        if cleaned_input and cleaned_input != st.session_state["api_url"]:
+            st.session_state["api_url"] = cleaned_input
+            st.session_state["connection_status"] = None
+
+        # Auto-validate API connection if not checked yet for current URL
+        if st.session_state["connection_status"] is None and st.session_state["api_url"]:
+            is_valid, msg, t_low, t_high = validate_api_connection(st.session_state["api_url"])
+            st.session_state["connection_status"] = is_valid
+            st.session_state["connection_msg"] = msg
+            if is_valid and t_low is not None and t_high is not None:
+                st.session_state["tau_low"] = t_low
+                st.session_state["tau_high"] = t_high
 
         st.caption("💡 **Localtunnel Tip**: If using `loca.lt`, open the URL in a browser tab once to bypass the localtunnel IP password screen if prompted.")
 
@@ -557,7 +610,7 @@ def main():
             st.caption(st.session_state["connection_msg"])
             t_l = st.session_state.get("tau_low", 0.30)
             t_h = st.session_state.get("tau_high", 0.70)
-            st.info(f"📐 **Dynamic Thresholds**: τ_low = **{t_l:.2f}**, τ_high = **{t_h:.2f}**")
+            st.info(f"📐 **Dynamic Thresholds**: τ_low = **{t_l:.4f}**, τ_high = **{t_h:.4f}**")
         elif st.session_state["connection_status"] is False:
             st.error("🔴 API Status: Disconnected")
             st.caption(st.session_state["connection_msg"])
@@ -742,8 +795,11 @@ def main():
         # ----------------------------------------------------------------------
         # UNCERTAINTY VISUALIZATION & GENERATED RESPONSES
         # ----------------------------------------------------------------------
-        t_low_val = float(st.session_state.get("tau_low", 0.30))
-        t_high_val = float(st.session_state.get("tau_high", 0.70))
+        # Extract dynamic thresholds from result object first, fallback to session state
+        t_low_val = float(res.get("tau_low", res.get("TAU_LOW", st.session_state.get("tau_low", 0.30))))
+        t_high_val = float(res.get("tau_high", res.get("TAU_HIGH", st.session_state.get("tau_high", 0.70))))
+        st.session_state["tau_low"] = t_low_val
+        st.session_state["tau_high"] = t_high_val
 
         col_gauge, col_info = st.columns([5, 4])
 
@@ -754,7 +810,11 @@ def main():
                 tau_low=t_low_val,
                 tau_high=t_high_val
             )
-            st.plotly_chart(gauge_fig, use_container_width=True)
+            st.plotly_chart(
+                gauge_fig,
+                use_container_width=True,
+                key=f"plotly_gauge_{fused_unc:.4f}_{t_low_val:.4f}_{t_high_val:.4f}"
+            )
 
         with col_info:
             unc_level = "HIGH" if fused_unc >= t_high_val else ("MEDIUM" if fused_unc >= t_low_val else "LOW")
@@ -764,7 +824,7 @@ def main():
                 - **Query**: *"{res.get('query', query_text)}"*
                 - **Gate Decision**: `{gate_decision}`
                 - **Hallucination Detected**: `{"TRUE" if is_hallucination else "FALSE"}`
-                - **Uncertainty Level**: `{unc_level}` (τ_low = {t_low_val:.2f}, τ_high = {t_high_val:.2f})
+                - **Uncertainty Level**: `{unc_level}` (τ_low = {t_low_val:.4f}, τ_high = {t_high_val:.4f})
                 """
             )
 
