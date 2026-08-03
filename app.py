@@ -178,21 +178,51 @@ def sanitize_url(raw_url: str) -> str:
     return url.rstrip("/")
 
 
-def validate_api_connection(base_url: str, timeout: int = 20) -> Tuple[bool, str]:
+def validate_api_connection(base_url: str, timeout: int = 20) -> Tuple[bool, str, Optional[float], Optional[float]]:
     """
     Validate backend URL accessibility before running cascade calls.
-    Attempts to ping /predict endpoint or root docs with SSL verification bypass.
+    Attempts to ping /predict endpoint, /config, or root docs with SSL verification bypass,
+    and fetches dynamic tau_low and tau_high values if provided by backend.
     """
     cleaned_url = sanitize_url(base_url)
     if not cleaned_url:
-        return False, "URL cannot be empty."
+        return False, "URL cannot be empty.", None, None
+
+    tau_low: Optional[float] = None
+    tau_high: Optional[float] = None
+
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+
+    # Attempt 0: Check /config, /thresholds, or /health endpoints for dynamic parameters
+    for path in ["/config", "/thresholds", "/health"]:
+        try:
+            cfg_res = session.get(f"{cleaned_url}{path}", timeout=5, verify=False)
+            if cfg_res.status_code == 200:
+                low_txt = cfg_res.text.lower()
+                if not ("<html" in low_txt and ("localtunnel" in low_txt or "reminder" in low_txt or "password" in low_txt or "tunnel" in low_txt)):
+                    try:
+                        cfg_data = cfg_res.json()
+                        if isinstance(cfg_data, dict):
+                            for k_l in ["tau_low", "TAU_LOW", "tau_low_val", "threshold_low"]:
+                                if k_l in cfg_data and cfg_data[k_l] is not None:
+                                    tau_low = float(cfg_data[k_l])
+                                    break
+                            for k_h in ["tau_high", "TAU_HIGH", "tau_high_val", "threshold_high"]:
+                                if k_h in cfg_data and cfg_data[k_h] is not None:
+                                    tau_high = float(cfg_data[k_h])
+                                    break
+                            if tau_low is not None and tau_high is not None:
+                                return True, f"Connected to API backend ({cfg_res.status_code}) | Fetched τ_low = {tau_low:.2f}, τ_high = {tau_high:.2f}", tau_low, tau_high
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     predict_endpoint = f"{cleaned_url}/predict"
 
     # Attempt 1: Try POST /predict
     try:
-        session = requests.Session()
-        session.headers.update(DEFAULT_HEADERS)
         response = session.post(
             predict_endpoint,
             json={"query": "ping"},
@@ -203,42 +233,58 @@ def validate_api_connection(base_url: str, timeout: int = 20) -> Tuple[bool, str
         # Check if localtunnel is serving an HTML reminder / password page
         low_text = response.text.lower()
         if "<html" in low_text and ("localtunnel" in low_text or "reminder" in low_text or "password" in low_text or "tunnel" in low_text):
-            return False, f"Localtunnel password screen detected! Please open {cleaned_url} in a new browser tab once to submit your password or click 'Click to Continue'."
+            return False, f"Localtunnel password screen detected! Please open {cleaned_url} in a new browser tab once to submit your password or click 'Click to Continue'.", None, None
         
-        # 200 OK, 422 Unprocessable Entity, 400 Bad Request, or 405 Method Not Allowed indicates backend exists
+        # Check if 200 returned thresholds in json payload
+        if response.status_code == 200:
+            try:
+                res_json = response.json()
+                if isinstance(res_json, dict):
+                    for k_l in ["tau_low", "TAU_LOW", "tau_low_val"]:
+                        if k_l in res_json and res_json[k_l] is not None:
+                            tau_low = float(res_json[k_l])
+                            break
+                    for k_h in ["tau_high", "TAU_HIGH", "tau_high_val"]:
+                        if k_h in res_json and res_json[k_h] is not None:
+                            tau_high = float(res_json[k_h])
+                            break
+            except Exception:
+                pass
+
         if response.status_code in (200, 422, 400, 405):
-            return True, f"Connected successfully to API backend ({response.status_code})"
+            msg = f"Connected successfully to API backend ({response.status_code})"
+            if tau_low is not None and tau_high is not None:
+                msg += f" | Fetched τ_low = {tau_low:.2f}, τ_high = {tau_high:.2f}"
+            return True, msg, tau_low, tau_high
         
         if response.status_code == 404:
-            return True, f"Backend server reached at {cleaned_url} (HTTP 404)"
+            return True, f"Backend server reached at {cleaned_url} (HTTP 404)", tau_low, tau_high
 
-        return False, f"API returned status code {response.status_code}"
+        return False, f"API returned status code {response.status_code}", None, None
 
     except Exception as primary_exc:
         # Attempt 2: Fallback GET request to base URL or /docs
         try:
-            session = requests.Session()
-            session.headers.update(DEFAULT_HEADERS)
             get_res = session.get(cleaned_url, timeout=timeout, verify=False)
             low_text_get = get_res.text.lower()
             if "<html" in low_text_get and ("localtunnel" in low_text_get or "reminder" in low_text_get or "password" in low_text_get or "tunnel" in low_text_get):
-                return False, f"Localtunnel password screen detected! Please open {cleaned_url} in a new browser tab once to submit your password or click 'Click to Continue'."
+                return False, f"Localtunnel password screen detected! Please open {cleaned_url} in a new browser tab once to submit your password or click 'Click to Continue'.", None, None
 
             if get_res.status_code in (200, 404, 405, 422, 400):
-                return True, f"Connected to backend server ({get_res.status_code})"
+                return True, f"Connected to backend server ({get_res.status_code})", tau_low, tau_high
         except Exception:
             pass
 
         if isinstance(primary_exc, requests.exceptions.MissingSchema):
-            return False, "Invalid URL schema. Please include http:// or https://"
+            return False, "Invalid URL schema. Please include http:// or https://", None, None
         elif isinstance(primary_exc, requests.exceptions.InvalidURL):
-            return False, "Invalid URL format."
+            return False, "Invalid URL format.", None, None
         elif isinstance(primary_exc, requests.exceptions.Timeout):
-            return False, f"Connection timed out after {timeout}s. Verify your localtunnel or Colab server is active."
+            return False, f"Connection timed out after {timeout}s. Verify your localtunnel or Colab server is active.", None, None
         elif isinstance(primary_exc, requests.exceptions.ConnectionError):
-            return False, f"Connection refused/failed. Ensure FastAPI server & localtunnel process are running."
+            return False, f"Connection refused/failed. Ensure FastAPI server & localtunnel process are running.", None, None
         else:
-            return False, f"Connection error ({type(primary_exc).__name__}): {str(primary_exc)}"
+            return False, f"Connection error ({type(primary_exc).__name__}): {str(primary_exc)}", None, None
 
 
 def call_mscf_api(base_url: str, query: str, timeout: int = 60, max_retries: int = 3) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -345,20 +391,26 @@ def parse_semantic_clusters(cluster_map: Any, responses: List[str]) -> Tuple[Dic
 # 3. PLOTLY VISUALIZATIONS
 # ==============================================================================
 
-def create_fused_uncertainty_gauge(fused_uncertainty: float) -> go.Figure:
+def create_fused_uncertainty_gauge(
+    fused_uncertainty: float,
+    tau_low: float = 0.30,
+    tau_high: float = 0.70
+) -> go.Figure:
     """
     Create a Plotly gauge chart visualizing Fused Uncertainty (0 to 1 scale).
     Threshold markers:
-      tau_low = 0.30
-      tau_high = 0.70
+      tau_low (dynamic, e.g. 0.30 or 0.40)
+      tau_high (dynamic, e.g. 0.70 or 0.55)
     Color zones:
-      Low uncertainty (0.0 - 0.30): Green
-      Medium uncertainty (0.30 - 0.70): Orange/Yellow
-      High uncertainty (0.70 - 1.00): Red
+      Low uncertainty (0.0 - tau_low): Green
+      Medium uncertainty (tau_low - tau_high): Orange/Yellow
+      High uncertainty (tau_high - 1.00): Red
     """
-    # Clamp value between 0 and 1
+    # Clamp values between 0 and 1
     val = max(0.0, min(1.0, float(fused_uncertainty)))
-    
+    t_low = max(0.0, min(1.0, float(tau_low)))
+    t_high = max(t_low, min(1.0, float(tau_high)))
+
     fig = go.Figure(
         go.Indicator(
             mode="gauge+number",
@@ -373,9 +425,9 @@ def create_fused_uncertainty_gauge(fused_uncertainty: float) -> go.Figure:
                 "borderwidth": 2,
                 "bordercolor": "#cccccc",
                 "steps": [
-                    {"range": [0.0, 0.30], "color": "rgba(46, 204, 113, 0.45)"},   # Low (Green)
-                    {"range": [0.30, 0.70], "color": "rgba(243, 156, 18, 0.45)"},  # Medium (Yellow/Orange)
-                    {"range": [0.70, 1.00], "color": "rgba(231, 76, 60, 0.45)"},   # High (Red)
+                    {"range": [0.0, t_low], "color": "rgba(46, 204, 113, 0.45)"},   # Low (Green)
+                    {"range": [t_low, t_high], "color": "rgba(243, 156, 18, 0.45)"},  # Medium (Yellow/Orange)
+                    {"range": [t_high, 1.00], "color": "rgba(231, 76, 60, 0.45)"},   # High (Red)
                 ],
                 "threshold": {
                     "line": {"color": "#000000", "width": 4},
@@ -386,13 +438,16 @@ def create_fused_uncertainty_gauge(fused_uncertainty: float) -> go.Figure:
         )
     )
 
-    # Add threshold annotations
+    # Position annotations dynamically based on tau_low and tau_high
+    x_low = round(0.12 + 0.76 * t_low, 2)
+    x_high = round(0.12 + 0.76 * t_high, 2)
+
     fig.add_annotation(
-        x=0.24, y=0.15, text="<b>τ_low = 0.30</b>", showarrow=False,
+        x=x_low, y=0.15, text=f"<b>τ_low = {t_low:.2f}</b>", showarrow=False,
         font=dict(size=12, color="#27ae60")
     )
     fig.add_annotation(
-        x=0.76, y=0.15, text="<b>τ_high = 0.70</b>", showarrow=False,
+        x=x_high, y=0.15, text=f"<b>τ_high = {t_high:.2f}</b>", showarrow=False,
         font=dict(size=12, color="#c0392b")
     )
 
@@ -459,6 +514,10 @@ def main():
         st.session_state["connection_msg"] = ""
     if "last_result" not in st.session_state:
         st.session_state["last_result"] = None
+    if "tau_low" not in st.session_state:
+        st.session_state["tau_low"] = 0.30
+    if "tau_high" not in st.session_state:
+        st.session_state["tau_high"] = 0.70
 
     # --------------------------------------------------------------------------
     # SIDEBAR COMPONENT
@@ -484,15 +543,21 @@ def main():
             connect_btn = st.button("Connect", use_container_width=True, type="primary")
 
         if connect_btn:
-            with st.spinner("Testing API connection..."):
-                is_valid, msg = validate_api_connection(st.session_state["api_url"])
+            with st.spinner("Testing API connection & fetching thresholds..."):
+                is_valid, msg, t_low, t_high = validate_api_connection(st.session_state["api_url"])
                 st.session_state["connection_status"] = is_valid
                 st.session_state["connection_msg"] = msg
+                if is_valid and t_low is not None and t_high is not None:
+                    st.session_state["tau_low"] = t_low
+                    st.session_state["tau_high"] = t_high
 
         # Display connection status badge
         if st.session_state["connection_status"] is True:
             st.success("🟢 API Status: Connected")
             st.caption(st.session_state["connection_msg"])
+            t_l = st.session_state.get("tau_low", 0.30)
+            t_h = st.session_state.get("tau_high", 0.70)
+            st.info(f"📐 **Dynamic Thresholds**: τ_low = **{t_l:.2f}**, τ_high = **{t_h:.2f}**")
         elif st.session_state["connection_status"] is False:
             st.error("🔴 API Status: Disconnected")
             st.caption(st.session_state["connection_msg"])
@@ -565,6 +630,15 @@ def main():
                     st.session_state["last_result"] = None
                 else:
                     st.session_state["last_result"] = result_data
+                    if isinstance(result_data, dict):
+                        for k_l in ["tau_low", "TAU_LOW", "tau_low_val"]:
+                            if k_l in result_data and result_data[k_l] is not None:
+                                st.session_state["tau_low"] = float(result_data[k_l])
+                                break
+                        for k_h in ["tau_high", "TAU_HIGH", "tau_high_val"]:
+                            if k_h in result_data and result_data[k_h] is not None:
+                                st.session_state["tau_high"] = float(result_data[k_h])
+                                break
 
     # --------------------------------------------------------------------------
     # RESULTS RENDERING SECTION
@@ -668,21 +742,29 @@ def main():
         # ----------------------------------------------------------------------
         # UNCERTAINTY VISUALIZATION & GENERATED RESPONSES
         # ----------------------------------------------------------------------
+        t_low_val = float(st.session_state.get("tau_low", 0.30))
+        t_high_val = float(st.session_state.get("tau_high", 0.70))
+
         col_gauge, col_info = st.columns([5, 4])
 
         with col_gauge:
             st.markdown("### 🎯 Uncertainty Gauge")
-            gauge_fig = create_fused_uncertainty_gauge(fused_unc)
+            gauge_fig = create_fused_uncertainty_gauge(
+                fused_uncertainty=fused_unc,
+                tau_low=t_low_val,
+                tau_high=t_high_val
+            )
             st.plotly_chart(gauge_fig, use_container_width=True)
 
         with col_info:
+            unc_level = "HIGH" if fused_unc >= t_high_val else ("MEDIUM" if fused_unc >= t_low_val else "LOW")
             st.markdown("### 🔍 Cascade Evaluation Summary")
             st.markdown(
                 f"""
                 - **Query**: *"{res.get('query', query_text)}"*
                 - **Gate Decision**: `{gate_decision}`
                 - **Hallucination Detected**: `{"TRUE" if is_hallucination else "FALSE"}`
-                - **Uncertainty Level**: `{"HIGH" if fused_unc >= 0.70 else ("MEDIUM" if fused_unc >= 0.30 else "LOW")}`
+                - **Uncertainty Level**: `{unc_level}` (τ_low = {t_low_val:.2f}, τ_high = {t_high_val:.2f})
                 """
             )
 
