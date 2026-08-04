@@ -701,10 +701,13 @@ def main():
         # Sample Queries for Quick Testing
         st.subheader("💡 Example Queries")
         sample_queries = [
-            "What is the capital of France?",
+            "How many seconds are there in one hour?",
+            "What is the capital of Sri Lanka?",
+            "What are the specifications of Apple's iPhone 18 Ultra Fold Mini?",
             "Explain quantum entanglement in simple terms.",
             "Who won the 2024 FIFA World Cup?",
             "What are the primary causes of climate change?",
+            "Who won the Nobel Prize in Artificial General Intelligence in 2024?",
         ]
 
         selected_sample = st.radio("Click to prefill query:", sample_queries, index=0)
@@ -734,7 +737,9 @@ def main():
     # Use selected sample as default prompt text if user hasn't overridden
     query_text = st.text_area(
         "Enter User Query:",
-        value=selected_sample if selected_sample else "What is the capital of France?",
+        value=(
+            selected_sample if selected_sample else "What is the capital of Sri Lanka?"
+        ),
         height=120,
         placeholder="Type your question or query here...",
         help="The query will be dispatched to <API_URL>/predict for multi-signal hallucination analysis.",
