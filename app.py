@@ -168,7 +168,7 @@ def sanitize_url(raw_url: str) -> str:
     """
     if not raw_url:
         return ""
-    
+
     url = raw_url.strip()
     # Add default scheme if missing (http:// for localhost/IPs, https:// for domain tunnels)
     if not url.startswith("http://") and not url.startswith("https://"):
@@ -176,127 +176,151 @@ def sanitize_url(raw_url: str) -> str:
             url = "http://" + url
         else:
             url = "https://" + url
-        
+
     url = url.rstrip("/")
     if url.endswith("/predict"):
         url = url[:-8]
-        
+
     return url.rstrip("/")
 
 
-def validate_api_connection(base_url: str, timeout: int = 20) -> Tuple[bool, str, Optional[float], Optional[float]]:
+def fetch_thresholds_from_backend(
+    base_url: str, timeout: int = 5
+) -> Tuple[Optional[float], Optional[float]]:
     """
-    Validate backend URL accessibility before running cascade calls.
-    Attempts to ping /predict endpoint, /config, or root docs with SSL verification bypass,
-    and fetches dynamic tau_low and tau_high values if provided by backend.
+    Query GET /thresholds endpoint on the backend API to dynamically fetch tau_low and tau_high values.
+    Sends: GET <URL>/thresholds with Header Accept: application/json
+    Example Response: {"tau_low": 0.3149494001764102, "tau_high": 0.5849060288990476}
+    """
+    cleaned_url = sanitize_url(base_url)
+    if not cleaned_url:
+        return None, None
+
+    endpoint = f"{cleaned_url}/thresholds"
+    headers = dict(DEFAULT_HEADERS)
+    headers["Accept"] = "application/json"
+
+    session = requests.Session()
+    session.headers.update(headers)
+
+    try:
+        res = session.get(endpoint, timeout=timeout, verify=False)
+        if res.status_code == 200:
+            low_text = res.text.lower()
+            if not (
+                "<html" in low_text
+                and (
+                    "localtunnel" in low_text
+                    or "reminder" in low_text
+                    or "password" in low_text
+                    or "tunnel" in low_text
+                    or "ngrok" in low_text
+                )
+            ):
+                data = res.json()
+                if isinstance(data, dict):
+                    tau_low = None
+                    tau_high = None
+                    for k in ["tau_low", "TAU_LOW", "tau_low_val", "threshold_low"]:
+                        if k in data and data[k] is not None:
+                            tau_low = float(data[k])
+                            break
+                    for k in ["tau_high", "TAU_HIGH", "tau_high_val", "threshold_high"]:
+                        if k in data and data[k] is not None:
+                            tau_high = float(data[k])
+                            break
+                    return tau_low, tau_high
+    except Exception:
+        pass
+
+    return None, None
+
+
+def validate_api_connection(
+    base_url: str, timeout: int = 20
+) -> Tuple[bool, str, Optional[float], Optional[float]]:
+    """
+    Validate backend URL accessibility by querying GET /thresholds endpoint.
+    Retrieves dynamic tau_low and tau_high threshold values without triggering LLM model inference.
     """
     cleaned_url = sanitize_url(base_url)
     if not cleaned_url:
         return False, "URL cannot be empty.", None, None
 
-    tau_low: Optional[float] = None
-    tau_high: Optional[float] = None
+    # Fetch dynamic thresholds strictly from backend GET /thresholds endpoint
+    t_low, t_high = fetch_thresholds_from_backend(cleaned_url, timeout=timeout)
 
+    if t_low is not None and t_high is not None:
+        msg = f"Connected successfully to API backend | Fetched GET /thresholds: τ_low = {t_low:.4f}, τ_high = {t_high:.4f}"
+        return True, msg, t_low, t_high
+
+    # If /thresholds response had no values, perform lightweight GET connection check
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
 
-    # Attempt 0: Check /config, /thresholds, or /health endpoints for dynamic parameters
-    for path in ["/config", "/thresholds", "/health"]:
-        try:
-            cfg_res = session.get(f"{cleaned_url}{path}", timeout=5, verify=False)
-            if cfg_res.status_code == 200:
-                low_txt = cfg_res.text.lower()
-                if not ("<html" in low_txt and ("localtunnel" in low_txt or "reminder" in low_txt or "password" in low_txt or "tunnel" in low_txt or "ngrok" in low_txt)):
-                    try:
-                        cfg_data = cfg_res.json()
-                        if isinstance(cfg_data, dict):
-                            for k_l in ["tau_low", "TAU_LOW", "tau_low_val", "threshold_low"]:
-                                if k_l in cfg_data and cfg_data[k_l] is not None:
-                                    tau_low = float(cfg_data[k_l])
-                                    break
-                            for k_h in ["tau_high", "TAU_HIGH", "tau_high_val", "threshold_high"]:
-                                if k_h in cfg_data and cfg_data[k_h] is not None:
-                                    tau_high = float(cfg_data[k_h])
-                                    break
-                            if tau_low is not None and tau_high is not None:
-                                return True, f"Connected to API backend ({cfg_res.status_code}) | Fetched τ_low = {tau_low:.4f}, τ_high = {tau_high:.4f}", tau_low, tau_high
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-    predict_endpoint = f"{cleaned_url}/predict"
-
-    # Attempt 1: Try POST /predict
     try:
-        response = session.post(
-            predict_endpoint,
-            json={"query": "ping"},
-            timeout=timeout,
-            verify=False
-        )
-
-        # Check if localtunnel is serving an HTML reminder / password page
+        response = session.get(cleaned_url, timeout=timeout, verify=False)
         low_text = response.text.lower()
-        if "<html" in low_text and ("localtunnel" in low_text or "reminder" in low_text or "password" in low_text or "friendly reminder" in low_text):
-            return False, f"Tunnel password/reminder screen detected! Please open {cleaned_url} in a new browser tab once to submit your password or click 'Click to Continue'.", None, None
+        if "<html" in low_text and (
+            "localtunnel" in low_text
+            or "reminder" in low_text
+            or "password" in low_text
+            or "friendly reminder" in low_text
+            or "ngrok" in low_text
+        ):
+            return (
+                False,
+                f"Tunnel password/reminder screen detected! Please open {cleaned_url} in a new browser tab once to submit your password or click 'Click to Continue'.",
+                None,
+                None,
+            )
 
-        # Check if 200 returned thresholds in json payload
-        if response.status_code == 200:
-            try:
-                res_json = response.json()
-                if isinstance(res_json, dict):
-                    for k_l in ["tau_low", "TAU_LOW", "tau_low_val"]:
-                        if k_l in res_json and res_json[k_l] is not None:
-                            tau_low = float(res_json[k_l])
-                            break
-                    for k_h in ["tau_high", "TAU_HIGH", "tau_high_val"]:
-                        if k_h in res_json and res_json[k_h] is not None:
-                            tau_high = float(res_json[k_h])
-                            break
-            except Exception:
-                pass
-
-        if response.status_code in (200, 422, 400, 405):
-            msg = f"Connected successfully to API backend ({response.status_code})"
-            if tau_low is not None and tau_high is not None:
-                msg += f" | Fetched τ_low = {tau_low:.4f}, τ_high = {tau_high:.4f}"
-            return True, msg, tau_low, tau_high
-
-        if response.status_code == 404:
-            return True, f"Backend server reached at {cleaned_url} (HTTP 404)", tau_low, tau_high
+        if response.status_code in (200, 404, 405, 422, 400):
+            msg = f"Connected to backend server ({response.status_code})"
+            return True, msg, t_low, t_high
 
         return False, f"API returned status code {response.status_code}", None, None
 
-    except Exception as primary_exc:
-        # Attempt 2: Fallback GET request to base URL or /docs
-        try:
-            get_res = session.get(cleaned_url, timeout=timeout, verify=False)
-            low_text_get = get_res.text.lower()
-            if "<html" in low_text_get and ("localtunnel" in low_text_get or "reminder" in low_text_get or "password" in low_text_get):
-                return False, f"Tunnel password/reminder screen detected! Please open {cleaned_url} in a new browser tab once to submit your password.", None, None
-
-            if get_res.status_code in (200, 404, 405, 422, 400):
-                return True, f"Connected to backend server ({get_res.status_code})", tau_low, tau_high
-        except Exception:
-            pass
-
-        if isinstance(primary_exc, requests.exceptions.MissingSchema):
-            return False, "Invalid URL schema. Please include http:// or https://", None, None
-        elif isinstance(primary_exc, requests.exceptions.InvalidURL):
+    except Exception as exc:
+        if isinstance(exc, requests.exceptions.MissingSchema):
+            return (
+                False,
+                "Invalid URL schema. Please include http:// or https://",
+                None,
+                None,
+            )
+        elif isinstance(exc, requests.exceptions.InvalidURL):
             return False, "Invalid URL format.", None, None
-        elif isinstance(primary_exc, requests.exceptions.Timeout):
-            return False, f"Connection timed out after {timeout}s. Verify your localtunnel, ngrok or Colab server is active.", None, None
-        elif isinstance(primary_exc, requests.exceptions.ConnectionError):
-            return False, f"Connection refused/failed. Ensure FastAPI server & tunnel process are running.", None, None
+        elif isinstance(exc, requests.exceptions.Timeout):
+            return (
+                False,
+                f"Connection timed out after {timeout}s. Verify your backend server & tunnel are active.",
+                None,
+                None,
+            )
+        elif isinstance(exc, requests.exceptions.ConnectionError):
+            return (
+                False,
+                "Connection refused/failed. Ensure FastAPI server & tunnel process are running.",
+                None,
+                None,
+            )
         else:
-            return False, f"Connection error ({type(primary_exc).__name__}): {str(primary_exc)}", None, None
+            return (
+                False,
+                f"Connection error ({type(exc).__name__}): {str(exc)}",
+                None,
+                None,
+            )
 
 
-def call_mscf_api(base_url: str, query: str, timeout: int = 60, max_retries: int = 3) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def call_mscf_api(
+    base_url: str, query: str, timeout: int = 60, max_retries: int = 3
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Execute HTTP POST request to <API_URL>/predict with query payload.
     Includes retry logic and Connection: close header for localtunnel socket stability.
+    Always fetches dynamic threshold values from GET /thresholds.
     """
     cleaned_url = sanitize_url(base_url)
     if not cleaned_url:
@@ -314,10 +338,7 @@ def call_mscf_api(base_url: str, query: str, timeout: int = 60, max_retries: int
             session.headers.update(DEFAULT_HEADERS)
 
             response = session.post(
-                endpoint,
-                json=payload,
-                timeout=timeout,
-                verify=False
+                endpoint, json=payload, timeout=timeout, verify=False
             )
             elapsed = time.time() - start_time
 
@@ -327,52 +348,65 @@ def call_mscf_api(base_url: str, query: str, timeout: int = 60, max_retries: int
                     data = response.json()
                     if "execution_time" not in data or data["execution_time"] is None:
                         data["execution_time"] = round(elapsed, 2)
-                    
-                    # Auto-fetch thresholds if missing in /predict response payload
-                    has_l = any(k in data and data[k] is not None for k in ["tau_low", "TAU_LOW"])
-                    has_h = any(k in data and data[k] is not None for k in ["tau_high", "TAU_HIGH"])
-                    if not (has_l and has_h):
-                        for cfg_p in ["/config", "/thresholds"]:
-                            try:
-                                c_res = session.get(f"{cleaned_url}{cfg_p}", timeout=3, verify=False)
-                                if c_res.status_code == 200:
-                                    c_json = c_res.json()
-                                    if isinstance(c_json, dict):
-                                        if "tau_low" in c_json and c_json["tau_low"] is not None:
-                                            data["tau_low"] = float(c_json["tau_low"])
-                                        if "tau_high" in c_json and c_json["tau_high"] is not None:
-                                            data["tau_high"] = float(c_json["tau_high"])
-                                        break
-                            except Exception:
-                                pass
+
+                    # Unconditionally fetch dynamic thresholds from GET /thresholds
+                    t_low, t_high = fetch_thresholds_from_backend(cleaned_url)
+                    if t_low is not None:
+                        data["tau_low"] = t_low
+                    if t_high is not None:
+                        data["tau_high"] = t_high
+
+                    return data, None
 
                     return data, None
                 except json.JSONDecodeError:
-                    return None, "Malformed Response: Server returned invalid JSON payload."
-            
+                    return (
+                        None,
+                        "Malformed Response: Server returned invalid JSON payload.",
+                    )
+
             elif response.status_code == 500:
-                return None, f"500 Internal Server Error: The backend encountered an unhandled exception while processing query."
+                return (
+                    None,
+                    f"500 Internal Server Error: The backend encountered an unhandled exception while processing query.",
+                )
             elif response.status_code == 404:
-                return None, f"404 Not Found: Endpoint '{endpoint}' does not exist. Ensure FastAPI has a POST /predict route."
+                return (
+                    None,
+                    f"404 Not Found: Endpoint '{endpoint}' does not exist. Ensure FastAPI has a POST /predict route.",
+                )
             else:
                 return None, f"HTTP Error {response.status_code}: {response.text}"
 
-        except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
-            last_err_msg = f"Attempt {attempt}/{max_retries} failed ({type(e).__name__}): {str(e)}"
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ) as e:
+            last_err_msg = (
+                f"Attempt {attempt}/{max_retries} failed ({type(e).__name__}): {str(e)}"
+            )
             if attempt < max_retries:
                 time.sleep(1.0)
                 continue
         except requests.exceptions.Timeout:
-            return None, f"Timeout Error: Request timed out after {timeout} seconds. The backend model inference is taking too long."
+            return (
+                None,
+                f"Timeout Error: Request timed out after {timeout} seconds. The backend model inference is taking too long.",
+            )
         except requests.exceptions.InvalidURL:
             return None, "Invalid URL Error: The configured API URL is malformed."
         except Exception as e:
             return None, f"Unexpected Error ({type(e).__name__}): {str(e)}"
 
-    return None, f"Connection Failed after {max_retries} attempts ({last_err_msg}). Ensure localtunnel connection is open."
+    return (
+        None,
+        f"Connection Failed after {max_retries} attempts ({last_err_msg}). Ensure localtunnel connection is open.",
+    )
 
 
-def parse_semantic_clusters(cluster_map: Any, responses: List[str]) -> Tuple[Dict[str, List[str]], Dict[str, int]]:
+def parse_semantic_clusters(
+    cluster_map: Any, responses: List[str]
+) -> Tuple[Dict[str, List[str]], Dict[str, int]]:
     """
     Flexibly parse semantic cluster maps returned by backend.
     Supports formats:
@@ -383,7 +417,7 @@ def parse_semantic_clusters(cluster_map: Any, responses: List[str]) -> Tuple[Dic
       (clusters_dict, cluster_sizes_dict)
     """
     clusters: Dict[str, List[str]] = {}
-    
+
     if not cluster_map:
         return clusters, {}
 
@@ -416,32 +450,27 @@ def parse_semantic_clusters(cluster_map: Any, responses: List[str]) -> Tuple[Dic
 # 3. PLOTLY VISUALIZATIONS
 # ==============================================================================
 
+
 def create_fused_uncertainty_gauge(
     fused_uncertainty: float,
-    tau_low: float = 0.30,
-    tau_high: float = 0.70
+    tau_low: Optional[float] = None,
+    tau_high: Optional[float] = None,
 ) -> go.Figure:
     """
     Create a Plotly gauge chart visualizing Fused Uncertainty (0 to 1 scale).
-    Threshold markers:
-      tau_low (dynamic, e.g. 0.30 or 0.40)
-      tau_high (dynamic, e.g. 0.70 or 0.55)
+    Threshold markers tau_low and tau_high are dynamically retrieved from backend GET /thresholds.
     Color zones:
       Low uncertainty (0.0 - tau_low): Green
       Medium uncertainty (tau_low - tau_high): Orange/Yellow
       High uncertainty (tau_high - 1.00): Red
-      Low uncertainty (0.0 - tau_low): Green
-      Medium uncertainty (tau_low - tau_high): Orange/Yellow
-      High uncertainty (tau_high - 1.00): Red
     """
-    # Clamp values between 0 and 1
-    # Clamp values between 0 and 1
-    val = max(0.0, min(1.0, float(fused_uncertainty)))
-    t_low = max(0.0, min(1.0, float(tau_low)))
-    t_high = max(t_low, min(1.0, float(tau_high)))
+    # Use dynamically fetched backend values or fallback defaults (0.30, 0.70)
+    t_low_val = 0.30 if tau_low is None else float(tau_low)
+    t_high_val = 0.70 if tau_high is None else float(tau_high)
 
-    t_low = max(0.0, min(1.0, float(tau_low)))
-    t_high = max(t_low, min(1.0, float(tau_high)))
+    val = max(0.0, min(1.0, float(fused_uncertainty)))
+    t_low = max(0.0, min(1.0, t_low_val))
+    t_high = max(t_low, min(1.0, t_high_val))
 
     fig = go.Figure(
         go.Indicator(
@@ -449,8 +478,8 @@ def create_fused_uncertainty_gauge(
             value=val,
             domain={"x": [0, 1], "y": [0, 1]},
             title={
-                "text": f"<b>Fused Uncertainty Metric</b><br><span style='font-size:12px;color:#555555;'>Color Bands: Low (≤ {t_low:.4f}) | Med ({t_low:.4f}–{t_high:.4f}) | High (≥ {t_high:.4f})</span>",
-                "font": {"size": 17}
+                "text": f"<b>Fused Uncertainty Metric</b><br><span style='font-size:12px;color:#555555;'>Dynamic Thresholds (GET /thresholds): Low (≤ {t_low:.4f}) | Med ({t_low:.4f}–{t_high:.4f}) | High (≥ {t_high:.4f})</span>",
+                "font": {"size": 17},
             },
             number={"valueformat": ".3f", "font": {"size": 28}},
             gauge={
@@ -460,12 +489,18 @@ def create_fused_uncertainty_gauge(
                 "borderwidth": 2,
                 "bordercolor": "#cccccc",
                 "steps": [
-                    {"range": [0.0, t_low], "color": "rgba(46, 204, 113, 0.45)"},   # Low (Green)
-                    {"range": [t_low, t_high], "color": "rgba(243, 156, 18, 0.45)"},  # Medium (Yellow/Orange)
-                    {"range": [t_high, 1.00], "color": "rgba(231, 76, 60, 0.45)"},   # High (Red)
-                    {"range": [0.0, t_low], "color": "rgba(46, 204, 113, 0.45)"},   # Low (Green)
-                    {"range": [t_low, t_high], "color": "rgba(243, 156, 18, 0.45)"},  # Medium (Yellow/Orange)
-                    {"range": [t_high, 1.00], "color": "rgba(231, 76, 60, 0.45)"},   # High (Red)
+                    {
+                        "range": [0.0, t_low],
+                        "color": "rgba(46, 204, 113, 0.45)",
+                    },  # Low (Green)
+                    {
+                        "range": [t_low, t_high],
+                        "color": "rgba(243, 156, 18, 0.45)",
+                    },  # Medium (Yellow/Orange)
+                    {
+                        "range": [t_high, 1.00],
+                        "color": "rgba(231, 76, 60, 0.45)",
+                    },  # High (Red)
                 ],
                 "threshold": {
                     "line": {"color": "#000000", "width": 4},
@@ -486,16 +521,30 @@ def create_fused_uncertainty_gauge(
     y_high = round(0.18 + 0.28 * math.sin(rad_high), 3)
 
     fig.add_annotation(
-        x=x_low, y=y_low, text=f"<b>τ_low = {t_low:.4f}</b>", showarrow=True,
-        arrowhead=2, arrowsize=1, arrowwidth=2, arrowcolor="#27ae60",
-        ax=0, ay=25 if t_low < 0.5 else -25,
-        font=dict(size=12, color="#27ae60", family="sans-serif")
+        x=x_low,
+        y=y_low,
+        text=f"<b>τ_low = {t_low:.4f}</b>",
+        showarrow=True,
+        arrowhead=2,
+        arrowsize=1,
+        arrowwidth=2,
+        arrowcolor="#27ae60",
+        ax=0,
+        ay=25 if t_low < 0.5 else -25,
+        font=dict(size=12, color="#27ae60", family="sans-serif"),
     )
     fig.add_annotation(
-        x=x_high, y=y_high, text=f"<b>τ_high = {t_high:.4f}</b>", showarrow=True,
-        arrowhead=2, arrowsize=1, arrowwidth=2, arrowcolor="#c0392b",
-        ax=0, ay=25 if t_high < 0.5 else -25,
-        font=dict(size=12, color="#c0392b", family="sans-serif")
+        x=x_high,
+        y=y_high,
+        text=f"<b>τ_high = {t_high:.4f}</b>",
+        showarrow=True,
+        arrowhead=2,
+        arrowsize=1,
+        arrowwidth=2,
+        arrowcolor="#c0392b",
+        ax=0,
+        ay=25 if t_high < 0.5 else -25,
+        font=dict(size=12, color="#c0392b", family="sans-serif"),
     )
 
     fig.update_layout(
@@ -515,8 +564,7 @@ def create_cluster_bar_chart(cluster_sizes: Dict[str, int]) -> go.Figure:
         df = pd.DataFrame({"Cluster ID": ["No Clusters"], "Cluster Size": [0]})
     else:
         df = pd.DataFrame(
-            list(cluster_sizes.items()),
-            columns=["Cluster ID", "Cluster Size"]
+            list(cluster_sizes.items()), columns=["Cluster ID", "Cluster Size"]
         )
 
     fig = px.bar(
@@ -528,7 +576,7 @@ def create_cluster_bar_chart(cluster_sizes: Dict[str, int]) -> go.Figure:
         color_discrete_sequence=px.colors.qualitative.Bold,
         title="Semantic Cluster Sizes",
     )
-    
+
     fig.update_traces(textposition="outside")
     fig.update_layout(
         height=300,
@@ -547,11 +595,12 @@ def create_cluster_bar_chart(cluster_sizes: Dict[str, int]) -> go.Figure:
 # 4. STREAMLIT APPLICATION COMPONENT & MAIN LOOP
 # ==============================================================================
 
+
 def main():
     """
     Main Streamlit application entrypoint rendering MSCF Dashboard.
     """
-    
+
     # Initialize session state variables
     if "api_url" not in st.session_state:
         st.session_state["api_url"] = "https://mighty-emus-fall.loca.lt"
@@ -567,8 +616,12 @@ def main():
         st.session_state["tau_high"] = 0.70
 
     # Auto-check API connection on initial load to fetch dynamic thresholds
-    if st.session_state["connection_status"] is None and st.session_state.get("api_url"):
-        is_valid, msg, t_low, t_high = validate_api_connection(st.session_state["api_url"])
+    if st.session_state["connection_status"] is None and st.session_state.get(
+        "api_url"
+    ):
+        is_valid, msg, t_low, t_high = validate_api_connection(
+            st.session_state["api_url"]
+        )
         st.session_state["connection_status"] = is_valid
         st.session_state["connection_msg"] = msg
         if is_valid and t_low is not None and t_high is not None:
@@ -581,30 +634,37 @@ def main():
     with st.sidebar:
         st.header("⚙️ API Configuration")
         st.caption("Connect to your MSCF FastAPI backend endpoint.")
-        
+
         # API URL Input field
         url_input = st.text_input(
             "FastAPI Base URL",
             value=st.session_state["api_url"],
             placeholder="https://mighty-emus-fall.loca.lt",
-            help="Paste your public tunnel or local FastAPI base URL. The application automatically appends /predict."
+            help="Paste your public tunnel or local FastAPI base URL. The application automatically appends /predict.",
         )
-        
+
         cleaned_input = url_input.strip()
         if cleaned_input and cleaned_input != st.session_state["api_url"]:
             st.session_state["api_url"] = cleaned_input
             st.session_state["connection_status"] = None
 
         # Auto-validate API connection if not checked yet for current URL
-        if st.session_state["connection_status"] is None and st.session_state["api_url"]:
-            is_valid, msg, t_low, t_high = validate_api_connection(st.session_state["api_url"])
+        if (
+            st.session_state["connection_status"] is None
+            and st.session_state["api_url"]
+        ):
+            is_valid, msg, t_low, t_high = validate_api_connection(
+                st.session_state["api_url"]
+            )
             st.session_state["connection_status"] = is_valid
             st.session_state["connection_msg"] = msg
             if is_valid and t_low is not None and t_high is not None:
                 st.session_state["tau_low"] = t_low
                 st.session_state["tau_high"] = t_high
 
-        st.caption("💡 **Localtunnel Tip**: If using `loca.lt`, open the URL in a browser tab once to bypass the localtunnel IP password screen if prompted.")
+        st.caption(
+            "💡 **Localtunnel Tip**: If using `loca.lt`, open the URL in a browser tab once to bypass the localtunnel IP password screen if prompted."
+        )
 
         col_conn, col_space = st.columns([1, 1])
         with col_conn:
@@ -612,7 +672,9 @@ def main():
 
         if connect_btn:
             with st.spinner("Testing API connection & fetching thresholds..."):
-                is_valid, msg, t_low, t_high = validate_api_connection(st.session_state["api_url"])
+                is_valid, msg, t_low, t_high = validate_api_connection(
+                    st.session_state["api_url"]
+                )
                 st.session_state["connection_status"] = is_valid
                 st.session_state["connection_msg"] = msg
                 if is_valid and t_low is not None and t_high is not None:
@@ -625,7 +687,9 @@ def main():
             st.caption(st.session_state["connection_msg"])
             t_l = st.session_state.get("tau_low", 0.30)
             t_h = st.session_state.get("tau_high", 0.70)
-            st.info(f"📐 **Dynamic Thresholds**: τ_low = **{t_l:.4f}**, τ_high = **{t_h:.4f}**")
+            st.info(
+                f"📐 **Dynamic Thresholds**: τ_low = **{t_l:.4f}**, τ_high = **{t_h:.4f}**"
+            )
         elif st.session_state["connection_status"] is False:
             st.error("🔴 API Status: Disconnected")
             st.caption(st.session_state["connection_msg"])
@@ -640,11 +704,11 @@ def main():
             "What is the capital of France?",
             "Explain quantum entanglement in simple terms.",
             "Who won the 2024 FIFA World Cup?",
-            "What are the primary causes of climate change?"
+            "What are the primary causes of climate change?",
         ]
-        
+
         selected_sample = st.radio("Click to prefill query:", sample_queries, index=0)
-        
+
         st.divider()
         st.markdown(
             "**About MSCF System**\n"
@@ -673,12 +737,14 @@ def main():
         value=selected_sample if selected_sample else "What is the capital of France?",
         height=120,
         placeholder="Type your question or query here...",
-        help="The query will be dispatched to <API_URL>/predict for multi-signal hallucination analysis."
+        help="The query will be dispatched to <API_URL>/predict for multi-signal hallucination analysis.",
     )
 
     col_run, col_clear = st.columns([2, 10])
     with col_run:
-        run_button = st.button("🚀 Run Cascade", type="primary", use_container_width=True)
+        run_button = st.button(
+            "🚀 Run Cascade", type="primary", use_container_width=True
+        )
 
     # Handle Cascade Execution
     if run_button:
@@ -687,10 +753,11 @@ def main():
         elif not st.session_state["api_url"].strip():
             st.error("❌ Please provide a valid FastAPI endpoint URL in the sidebar.")
         else:
-            with st.spinner("⏳ Running MSCF Cascade Pipeline... Sampling responses and calculating uncertainty metrics..."):
+            with st.spinner(
+                "⏳ Running MSCF Cascade Pipeline... Sampling responses and calculating uncertainty metrics..."
+            ):
                 result_data, error_msg = call_mscf_api(
-                    base_url=st.session_state["api_url"],
-                    query=query_text.strip()
+                    base_url=st.session_state["api_url"], query=query_text.strip()
                 )
 
                 if error_msg:
@@ -728,7 +795,7 @@ def main():
                     <span style="font-size: 0.9rem; font-weight: normal; margin-left: auto;">Gate Decision: <b>{gate_decision}</b></span>
                 </div>
                 """,
-                unsafe_allow_html=True
+                unsafe_allow_html=True,
             )
         else:
             st.markdown(
@@ -738,7 +805,7 @@ def main():
                     <span style="font-size: 0.9rem; font-weight: normal; margin-left: auto;">Gate Decision: <b>{gate_decision}</b></span>
                 </div>
                 """,
-                unsafe_allow_html=True
+                unsafe_allow_html=True,
             )
 
         # 2. Final Answer Highlighted Card
@@ -750,14 +817,14 @@ def main():
                 <div class="answer-body">{final_answer}</div>
             </div>
             """,
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
 
         # ----------------------------------------------------------------------
         # METRICS SECTION
         # ----------------------------------------------------------------------
         st.markdown("### 📈 Core Uncertainty Metrics")
-        
+
         # Safely extract metric values with formatting defaults
         sem_entropy = res.get("semantic_entropy", 0.0)
         dispersion = res.get("dispersion", 0.0)
@@ -771,38 +838,62 @@ def main():
         with m1:
             st.metric(
                 label="Semantic Entropy",
-                value=f"{sem_entropy:.4f}" if isinstance(sem_entropy, (int, float)) else str(sem_entropy),
-                help="Measures semantic variability across sampled model responses."
+                value=(
+                    f"{sem_entropy:.4f}"
+                    if isinstance(sem_entropy, (int, float))
+                    else str(sem_entropy)
+                ),
+                help="Measures semantic variability across sampled model responses.",
             )
         with m2:
             st.metric(
                 label="Dispersion",
-                value=f"{dispersion:.4f}" if isinstance(dispersion, (int, float)) else str(dispersion),
-                help="Embedding space variance/dispersion across generated responses."
+                value=(
+                    f"{dispersion:.4f}"
+                    if isinstance(dispersion, (int, float))
+                    else str(dispersion)
+                ),
+                help="Embedding space variance/dispersion across generated responses.",
             )
         with m3:
             st.metric(
                 label="Logit Confidence",
-                value=f"{logit_conf:.4f}" if isinstance(logit_conf, (int, float)) else str(logit_conf),
-                help="Average output probability confidence from model logits."
+                value=(
+                    f"{logit_conf:.4f}"
+                    if isinstance(logit_conf, (int, float))
+                    else str(logit_conf)
+                ),
+                help="Average output probability confidence from model logits.",
             )
         with m4:
             st.metric(
                 label="Fused Uncertainty",
-                value=f"{fused_unc:.4f}" if isinstance(fused_unc, (int, float)) else str(fused_unc),
-                help="Combined multi-signal cascade uncertainty score."
+                value=(
+                    f"{fused_unc:.4f}"
+                    if isinstance(fused_unc, (int, float))
+                    else str(fused_unc)
+                ),
+                help="Combined multi-signal cascade uncertainty score.",
             )
         with m5:
             st.metric(
                 label="Execution Time",
-                value=f"{exec_time:.2f} s" if isinstance(exec_time, (int, float)) else str(exec_time),
-                help="Total processing time elapsed for cascade analysis."
+                value=(
+                    f"{exec_time:.2f} s"
+                    if isinstance(exec_time, (int, float))
+                    else str(exec_time)
+                ),
+                help="Total processing time elapsed for cascade analysis.",
             )
         with m6:
             st.metric(
                 label="Hallucination Conf.",
-                value=f"{hallucination_conf:.4f}" if isinstance(hallucination_conf, (int, float)) else str(hallucination_conf),
-                help="Overall probability score indicating potential hallucination."
+                value=(
+                    f"{hallucination_conf:.4f}"
+                    if isinstance(hallucination_conf, (int, float))
+                    else str(hallucination_conf)
+                ),
+                help="Overall probability score indicating potential hallucination.",
             )
 
         st.divider()
@@ -811,8 +902,16 @@ def main():
         # UNCERTAINTY VISUALIZATION & GENERATED RESPONSES
         # ----------------------------------------------------------------------
         # Extract dynamic thresholds from result object first, fallback to session state
-        t_low_val = float(res.get("tau_low", res.get("TAU_LOW", st.session_state.get("tau_low", 0.30))))
-        t_high_val = float(res.get("tau_high", res.get("TAU_HIGH", st.session_state.get("tau_high", 0.70))))
+        t_low_val = float(
+            res.get(
+                "tau_low", res.get("TAU_LOW", st.session_state.get("tau_low", 0.30))
+            )
+        )
+        t_high_val = float(
+            res.get(
+                "tau_high", res.get("TAU_HIGH", st.session_state.get("tau_high", 0.70))
+            )
+        )
         st.session_state["tau_low"] = t_low_val
         st.session_state["tau_high"] = t_high_val
 
@@ -821,18 +920,20 @@ def main():
         with col_gauge:
             st.markdown("### 🎯 Uncertainty Gauge")
             gauge_fig = create_fused_uncertainty_gauge(
-                fused_uncertainty=fused_unc,
-                tau_low=t_low_val,
-                tau_high=t_high_val
+                fused_uncertainty=fused_unc, tau_low=t_low_val, tau_high=t_high_val
             )
             st.plotly_chart(
                 gauge_fig,
                 use_container_width=True,
-                key=f"plotly_gauge_{fused_unc:.4f}_{t_low_val:.4f}_{t_high_val:.4f}"
+                key=f"plotly_gauge_{fused_unc:.4f}_{t_low_val:.4f}_{t_high_val:.4f}",
             )
 
         with col_info:
-            unc_level = "HIGH" if fused_unc >= t_high_val else ("MEDIUM" if fused_unc >= t_low_val else "LOW")
+            unc_level = (
+                "HIGH"
+                if fused_unc >= t_high_val
+                else ("MEDIUM" if fused_unc >= t_low_val else "LOW")
+            )
             st.markdown("### 🔍 Cascade Evaluation Summary")
             st.markdown(
                 f"""
@@ -851,7 +952,9 @@ def main():
 
         # 1. Generated Responses
         responses = res.get("responses", [])
-        with st.expander(f"💬 Generated Responses ({len(responses)} Samples)", expanded=False):
+        with st.expander(
+            f"💬 Generated Responses ({len(responses)} Samples)", expanded=False
+        ):
             if responses:
                 for idx, resp_text in enumerate(responses, start=1):
                     st.markdown(
@@ -861,7 +964,7 @@ def main():
                             <div style="margin-top: 0.4rem; line-height: 1.5;">{resp_text}</div>
                         </div>
                         """,
-                        unsafe_allow_html=True
+                        unsafe_allow_html=True,
                     )
             else:
                 st.info("No sampled responses provided in API output.")
@@ -869,7 +972,7 @@ def main():
         # 2. Semantic Clusters
         cluster_map = res.get("cluster_map", {})
         clusters, cluster_sizes = parse_semantic_clusters(cluster_map, responses)
-        
+
         with st.expander("🧩 Semantic Clusters & Size Distribution", expanded=False):
             col_cl_list, col_cl_chart = st.columns([1, 1])
 
@@ -891,12 +994,20 @@ def main():
         # 3. Deep Verification (NLI)
         nli_result = res.get("nli_result", None)
         with st.expander("🔬 Deep Verification (NLI Analysis)", expanded=False):
-            if nli_result and isinstance(nli_result, dict) and "confidence" in nli_result:
+            if (
+                nli_result
+                and isinstance(nli_result, dict)
+                and "confidence" in nli_result
+            ):
                 nli_conf = nli_result.get("confidence", 0.0)
                 st.success("✅ NLI Verification Executed")
                 st.metric(
                     label="NLI Entailment Confidence",
-                    value=f"{nli_conf:.2%}" if isinstance(nli_conf, (int, float)) else str(nli_conf)
+                    value=(
+                        f"{nli_conf:.2%}"
+                        if isinstance(nli_conf, (int, float))
+                        else str(nli_conf)
+                    ),
                 )
                 if len(nli_result) > 1:
                     st.json(nli_result)
