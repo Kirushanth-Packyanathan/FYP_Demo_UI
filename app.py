@@ -149,12 +149,14 @@ import urllib3
 # Suppress SSL certificate warnings when using SSL bypass for local tunnels
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Default HTTP Headers to bypass localtunnel reminder screens & handle proxies
+# Default HTTP Headers to bypass localtunnel/ngrok reminder screens & handle proxies
 DEFAULT_HEADERS = {
     "Content-Type": "application/json",
     "Connection": "close",
     "Bypass-Tunnel-Reminder": "true",
     "bypass-tunnel-reminder": "true",
+    "ngrok-skip-browser-warning": "true",
+    "Ngrok-Skip-Browser-Warning": "true",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MSCF-Streamlit-Frontend",
 }
 
@@ -168,9 +170,12 @@ def sanitize_url(raw_url: str) -> str:
         return ""
     
     url = raw_url.strip()
-    # Add default https scheme if missing
+    # Add default scheme if missing (http:// for localhost/IPs, https:// for domain tunnels)
     if not url.startswith("http://") and not url.startswith("https://"):
-        url = "https://" + url
+        if "localhost" in url or "127.0.0.1" in url or "0.0.0.0" in url:
+            url = "http://" + url
+        else:
+            url = "https://" + url
         
     url = url.rstrip("/")
     if url.endswith("/predict"):
@@ -201,7 +206,7 @@ def validate_api_connection(base_url: str, timeout: int = 20) -> Tuple[bool, str
             cfg_res = session.get(f"{cleaned_url}{path}", timeout=5, verify=False)
             if cfg_res.status_code == 200:
                 low_txt = cfg_res.text.lower()
-                if not ("<html" in low_txt and ("localtunnel" in low_txt or "reminder" in low_txt or "password" in low_txt or "tunnel" in low_txt)):
+                if not ("<html" in low_txt and ("localtunnel" in low_txt or "reminder" in low_txt or "password" in low_txt or "tunnel" in low_txt or "ngrok" in low_txt)):
                     try:
                         cfg_data = cfg_res.json()
                         if isinstance(cfg_data, dict):
@@ -233,27 +238,9 @@ def validate_api_connection(base_url: str, timeout: int = 20) -> Tuple[bool, str
 
         # Check if localtunnel is serving an HTML reminder / password page
         low_text = response.text.lower()
-        if "<html" in low_text and ("localtunnel" in low_text or "reminder" in low_text or "password" in low_text or "tunnel" in low_text):
-            return False, f"Localtunnel password screen detected! Please open {cleaned_url} in a new browser tab once to submit your password or click 'Click to Continue'.", None, None
-        
-        # Check if 200 returned thresholds in json payload
-        if response.status_code == 200:
-            try:
-                res_json = response.json()
-                if isinstance(res_json, dict):
-                    for k_l in ["tau_low", "TAU_LOW", "tau_low_val"]:
-                        if k_l in res_json and res_json[k_l] is not None:
-                            tau_low = float(res_json[k_l])
-                            break
-                    for k_h in ["tau_high", "TAU_HIGH", "tau_high_val"]:
-                        if k_h in res_json and res_json[k_h] is not None:
-                            tau_high = float(res_json[k_h])
-                            break
-            except Exception:
-                pass
+        if "<html" in low_text and ("localtunnel" in low_text or "reminder" in low_text or "password" in low_text or "friendly reminder" in low_text):
+            return False, f"Tunnel password/reminder screen detected! Please open {cleaned_url} in a new browser tab once to submit your password or click 'Click to Continue'.", None, None
 
-            return False, f"Localtunnel password screen detected! Please open {cleaned_url} in a new browser tab once to submit your password or click 'Click to Continue'.", None, None
-        
         # Check if 200 returned thresholds in json payload
         if response.status_code == 200:
             try:
@@ -275,12 +262,10 @@ def validate_api_connection(base_url: str, timeout: int = 20) -> Tuple[bool, str
             if tau_low is not None and tau_high is not None:
                 msg += f" | Fetched τ_low = {tau_low:.4f}, τ_high = {tau_high:.4f}"
             return True, msg, tau_low, tau_high
-        
+
         if response.status_code == 404:
             return True, f"Backend server reached at {cleaned_url} (HTTP 404)", tau_low, tau_high
-            return True, f"Backend server reached at {cleaned_url} (HTTP 404)", tau_low, tau_high
 
-        return False, f"API returned status code {response.status_code}", None, None
         return False, f"API returned status code {response.status_code}", None, None
 
     except Exception as primary_exc:
@@ -288,30 +273,23 @@ def validate_api_connection(base_url: str, timeout: int = 20) -> Tuple[bool, str
         try:
             get_res = session.get(cleaned_url, timeout=timeout, verify=False)
             low_text_get = get_res.text.lower()
-            if "<html" in low_text_get and ("localtunnel" in low_text_get or "reminder" in low_text_get or "password" in low_text_get or "tunnel" in low_text_get):
-                return False, f"Localtunnel password screen detected! Please open {cleaned_url} in a new browser tab once to submit your password or click 'Click to Continue'.", None, None
-                return False, f"Localtunnel password screen detected! Please open {cleaned_url} in a new browser tab once to submit your password or click 'Click to Continue'.", None, None
+            if "<html" in low_text_get and ("localtunnel" in low_text_get or "reminder" in low_text_get or "password" in low_text_get):
+                return False, f"Tunnel password/reminder screen detected! Please open {cleaned_url} in a new browser tab once to submit your password.", None, None
 
             if get_res.status_code in (200, 404, 405, 422, 400):
-                return True, f"Connected to backend server ({get_res.status_code})", tau_low, tau_high
                 return True, f"Connected to backend server ({get_res.status_code})", tau_low, tau_high
         except Exception:
             pass
 
         if isinstance(primary_exc, requests.exceptions.MissingSchema):
             return False, "Invalid URL schema. Please include http:// or https://", None, None
-            return False, "Invalid URL schema. Please include http:// or https://", None, None
         elif isinstance(primary_exc, requests.exceptions.InvalidURL):
             return False, "Invalid URL format.", None, None
-            return False, "Invalid URL format.", None, None
         elif isinstance(primary_exc, requests.exceptions.Timeout):
-            return False, f"Connection timed out after {timeout}s. Verify your localtunnel or Colab server is active.", None, None
-            return False, f"Connection timed out after {timeout}s. Verify your localtunnel or Colab server is active.", None, None
+            return False, f"Connection timed out after {timeout}s. Verify your localtunnel, ngrok or Colab server is active.", None, None
         elif isinstance(primary_exc, requests.exceptions.ConnectionError):
-            return False, f"Connection refused/failed. Ensure FastAPI server & localtunnel process are running.", None, None
-            return False, f"Connection refused/failed. Ensure FastAPI server & localtunnel process are running.", None, None
+            return False, f"Connection refused/failed. Ensure FastAPI server & tunnel process are running.", None, None
         else:
-            return False, f"Connection error ({type(primary_exc).__name__}): {str(primary_exc)}", None, None
             return False, f"Connection error ({type(primary_exc).__name__}): {str(primary_exc)}", None, None
 
 
@@ -635,13 +613,8 @@ def main():
         if connect_btn:
             with st.spinner("Testing API connection & fetching thresholds..."):
                 is_valid, msg, t_low, t_high = validate_api_connection(st.session_state["api_url"])
-            with st.spinner("Testing API connection & fetching thresholds..."):
-                is_valid, msg, t_low, t_high = validate_api_connection(st.session_state["api_url"])
                 st.session_state["connection_status"] = is_valid
                 st.session_state["connection_msg"] = msg
-                if is_valid and t_low is not None and t_high is not None:
-                    st.session_state["tau_low"] = t_low
-                    st.session_state["tau_high"] = t_high
                 if is_valid and t_low is not None and t_high is not None:
                     st.session_state["tau_low"] = t_low
                     st.session_state["tau_high"] = t_high
@@ -725,15 +698,6 @@ def main():
                     st.session_state["last_result"] = None
                 else:
                     st.session_state["last_result"] = result_data
-                    if isinstance(result_data, dict):
-                        for k_l in ["tau_low", "TAU_LOW", "tau_low_val"]:
-                            if k_l in result_data and result_data[k_l] is not None:
-                                st.session_state["tau_low"] = float(result_data[k_l])
-                                break
-                        for k_h in ["tau_high", "TAU_HIGH", "tau_high_val"]:
-                            if k_h in result_data and result_data[k_h] is not None:
-                                st.session_state["tau_high"] = float(result_data[k_h])
-                                break
                     if isinstance(result_data, dict):
                         for k_l in ["tau_low", "TAU_LOW", "tau_low_val"]:
                             if k_l in result_data and result_data[k_l] is not None:
@@ -868,7 +832,6 @@ def main():
             )
 
         with col_info:
-            unc_level = "HIGH" if fused_unc >= t_high_val else ("MEDIUM" if fused_unc >= t_low_val else "LOW")
             unc_level = "HIGH" if fused_unc >= t_high_val else ("MEDIUM" if fused_unc >= t_low_val else "LOW")
             st.markdown("### 🔍 Cascade Evaluation Summary")
             st.markdown(
