@@ -813,17 +813,20 @@ def main():
                 unsafe_allow_html=True,
             )
 
-        # 2. Final Answer Highlighted Card
-        final_answer = res.get("final_answer", "No answer returned.")
-        st.markdown(
-            f"""
-            <div class="answer-card">
-                <div class="answer-title">Final Answer Output</div>
-                <div class="answer-body">{final_answer}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        # 2. Final Answer Highlighted Card (Only displayed if response is accepted)
+        if not is_hallucination:
+            final_answer = res.get("final_answer", "No answer returned.")
+            st.markdown(
+                f"""
+                <div class="answer-card">
+                    <div class="answer-title">Final Answer Output</div>
+                    <div class="answer-body">{final_answer}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info("🚫 **Final Answer Suppressed**: Output was rejected by the cascade pipeline because potential hallucination was detected.")
 
         # ----------------------------------------------------------------------
         # METRICS SECTION
